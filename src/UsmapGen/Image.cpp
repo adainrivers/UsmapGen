@@ -18,6 +18,8 @@ constexpr std::uint16_t optionalHeaderPe32Plus = 0x20B;
 constexpr std::uint32_t sectionInitializedData = 0x40;
 constexpr std::uint32_t sectionExecute = 0x20000000;
 constexpr std::uint32_t sectionWrite = 0x80000000;
+constexpr std::uint32_t resourceDirectory = 2;
+constexpr std::uint32_t maxResourceSize = 16 * 1024 * 1024;
 constexpr std::uint32_t exceptionDirectory = 3;
 constexpr std::uint32_t relocationDirectory = 5;
 constexpr std::uint16_t relocationDir64 = 10;
@@ -83,6 +85,11 @@ std::expected<void, Error> Image::open() {
     const auto directory = [&](std::uint32_t index) {
         return std::pair{field(24 + 112 + 8 * index, std::uint32_t{}), field(24 + 112 + 8 * index + 4, std::uint32_t{})};
     };
+    if (optionalSize >= 112 + 8 * (resourceDirectory + 1) && field(24 + 108, std::uint32_t{}) > resourceDirectory) {
+        const auto [rva, size] = directory(resourceDirectory);
+        resourceRva = rva;
+        resourceSize = size;
+    }
     const auto [exceptionRva, exceptionSize] = directory(exceptionDirectory);
     functionTable = base + exceptionRva;
     functionCount = exceptionSize / runtimeFunctionSize;
@@ -130,10 +137,31 @@ std::expected<void, Error> Image::open() {
         return std::unexpected(Error{"The executable lacks a code, read-only data or writable data section."});
     //! A packer leaves a section without file data and fills it when the executable starts.
     if (code.fileSize == 0 || readOnlyData.fileSize == 0)
-        return std::unexpected(Error{"The executable is packed: its .text or .rdata section has no data in the file. A memory dump of the running executable has it."});
+        return std::unexpected(Error{"The executable is packed: its code or read-only data section has no data in the file. A memory dump of the running executable has it."});
     if (functionCount == 0)
         return std::unexpected(Error{"The executable has no exception directory."});
     return {};
+}
+
+//! Default.rc2 writes the engine version into the fixed fields; the displayed version strings are project-defined.
+std::optional<FileVersion> Image::readFileVersion() {
+    if (resourceRva == 0 || resourceSize == 0 || resourceSize > maxResourceSize || base > UINT64_MAX - resourceRva)
+        return std::nullopt;
+    const std::uint64_t address = base + resourceRva;
+    const Section* section = findSection(address);
+    if (section == nullptr)
+        return std::nullopt;
+    const std::uint64_t within = address - section->address;
+    if (within > section->fileSize || resourceSize > section->fileSize - within || resourceSize > section->virtualSize - within)
+        return std::nullopt;
+    const std::uint64_t offset = section->fileOffset + within;
+    if (offset > source.getSize() || resourceSize > source.getSize() - offset)
+        return std::nullopt;
+    std::vector<std::byte> bytes(resourceSize);
+    //! Optional metadata I/O must not set the reflection image's permanent error.
+    if (!source.read(offset, bytes))
+        return std::nullopt;
+    return error ? std::nullopt : readVersionResource(bytes, resourceRva);
 }
 
 void Image::fail(std::string message) {
@@ -290,15 +318,21 @@ std::string Image::readUtf8(std::uint64_t address) {
     std::string text;
     std::byte chunk[stringChunk];
     while (text.size() < maxStringLength) {
-        read(address, chunk);
+        const Section* section = findSection(address);
+        if (section == nullptr)
+            break;
+        //! A terminated string may end just before a section gap; do not read past it to fill a chunk.
+        const std::size_t count = std::size_t(std::min<std::uint64_t>(
+            std::min(stringChunk, maxStringLength - text.size()), section->virtualSize - (address - section->address)));
+        read(address, std::span(chunk, count));
         if (error)
             return {};
         const char* characters = reinterpret_cast<const char*>(chunk);
-        const std::size_t length = strnlen(characters, stringChunk);
+        const std::size_t length = strnlen(characters, count);
         text.append(characters, length);
-        if (length < stringChunk)
+        if (length < count)
             return text;
-        address += stringChunk;
+        address += count;
     }
     fail(std::format("The string at {:#x} has no end.", address));
     return {};

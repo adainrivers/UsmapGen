@@ -1,7 +1,6 @@
 #include "UsmapGen/Reflection.h"
 
 #include <algorithm>
-#include <bit>
 #include <format>
 #include <ranges>
 #include <string_view>
@@ -9,7 +8,9 @@
 #include <unordered_set>
 
 #include "UsmapGen/Code.h"
+#include "UsmapGen/Enum.h"
 #include "UsmapGen/Layout.h"
+#include "UsmapGen/Name.h"
 
 namespace UsmapGen {
 
@@ -145,10 +146,9 @@ std::optional<PropertyType> usmapTypeOf(Kind kind) {
     case Kind::Set: return PropertyType::Set;
     case Kind::Struct: return PropertyType::Struct;
     case Kind::Delegate: return PropertyType::Delegate;
-    //! The usmap dumpers write a sparse multicast delegate as MulticastInlineDelegate.
     case Kind::InlineMulticastDelegate:
-    case Kind::MulticastDelegate: return PropertyType::MulticastDelegate;
-    case Kind::SparseMulticastDelegate: return PropertyType::MulticastInlineDelegate;
+    case Kind::MulticastDelegate:
+    case Kind::SparseMulticastDelegate: return PropertyType::MulticastDelegate;
     case Kind::Text: return PropertyType::Text;
     case Kind::Enum: return PropertyType::Enum;
     case Kind::FieldPath: return PropertyType::FieldPath;
@@ -160,9 +160,10 @@ std::optional<PropertyType> usmapTypeOf(Kind kind) {
     }
 }
 
+//! The FName of a scoped enumerator keeps its scope, so only a bare one can match a hardcoded name.
 std::string_view shortEnumName(std::string_view full) {
     const std::size_t separator = full.rfind("::");
-    return separator == std::string_view::npos ? full : full.substr(separator + 2);
+    return separator == std::string_view::npos ? runtimeEnumName(full) : full.substr(separator + 2);
 }
 
 //! UEnum::GenerateEnumPrefix: the longest common prefix of the names, cut before its last underscore.
@@ -217,6 +218,7 @@ private:
     void applyStores(std::uint64_t function);
     bool collectBatches(std::span<const std::uint64_t> initializers);
     void collectSingles(std::span<const std::uint64_t> initializers);
+    void collectDeferredStructs(std::span<const std::uint64_t> initializers);
     void readEngine5Records(std::span<const Batch> batches);
     void classifySingles();
     void collectPackageTypes();
@@ -264,6 +266,7 @@ private:
     Schema schema;
 
     bool engine5 = false;
+    EnumMaxBehavior enumMax = EnumMaxBehavior::Legacy;
     const Layout* layout = nullptr;
     TypeNumbering numbering = TypeNumbering::Engine5;
     bool backward = true;
@@ -315,6 +318,9 @@ std::vector<std::uint64_t> Reflection::findInitializers() {
 //! A protector's entry point hides the CRT startup code, but .CRT$XCU stays the longest run of relocated code pointers in .rdata, with zeros between CRT sections.
 std::vector<std::uint64_t> Reflection::findInitializersInReadOnlyData() {
     const std::vector<std::uint64_t> slots = image.readPointerSlots(image.getReadOnlyData());
+    //! A protector can keep only its own relocations (Themida: one block for .tls), none of them in .rdata.
+    if (slots.empty() && !image.getError())
+        return findInitializersWithoutRelocations();
     struct Run {
         std::size_t first;
         std::size_t count;
@@ -544,6 +550,109 @@ void Reflection::collectSingles(std::span<const std::uint64_t> initializers) {
                 singleTypes.push_back({argument(package - 1), argument(package + 1)});
                 break;
             }
+        }
+    }
+}
+
+//! Speculative record candidates must not turn a malformed or unterminated name into an image error.
+std::optional<std::string> deferredName(Image& image, std::uint64_t address, bool wide) {
+    std::string name;
+    const std::uint64_t width = wide ? 2 : 1;
+    for (std::size_t i = 0; i < 256; i++, address += width) {
+        if (!image.isReadOnlyData(address) || !image.isReadOnlyData(address + width - 1))
+            return std::nullopt;
+        const auto c = wide ? image.read<char16_t>(address) : char16_t(image.read<std::uint8_t>(address));
+        if (c == 0)
+            return name.empty() ? std::nullopt : std::optional(name);
+        if (c < 0x20 || c > 0x7E)
+            return std::nullopt;
+        name += char(c);
+    }
+    return std::nullopt;
+}
+
+//! Inlined registration appends {Construct, null, Package, Name, RegistrationInfo} then notifies with FNames; require matching constructor output, FStructParams and package identity.
+void Reflection::collectDeferredStructs(std::span<const std::uint64_t> initializers) {
+    if (!engine5)
+        return;
+    const auto dataRange = [&](std::uint64_t at, std::uint64_t size) {
+        return at <= UINT64_MAX - size &&
+               ((image.isReadOnlyData(at) && image.isReadOnlyData(at + size - 1)) ||
+                (image.isWritableData(at) && image.isWritableData(at + size - 1)));
+    };
+    const auto preparedCalls = [&](std::uint64_t function) {
+        function = code.followThunks(function);
+        //! Match collectParams: constructors can initialize writable function-local parameter tables.
+        if (storedFunctions.insert(function).second)
+            applyStores(function);
+        return code.findCalls(function);
+    };
+    //! readType consumes the reference qword even for primitive properties, not just the name, kind and array dimension.
+    const auto propertySize = std::max({std::uint64_t(layout->propertyName) + 8, std::uint64_t(layout->propertyType) + 1,
+                                       std::uint64_t(layout->propertyArrayDim) + (layout->propertyArrayDim16 ? 2 : 4),
+                                       std::uint64_t(layout->propertyReference) + 8});
+    const auto propertiesValid = [&](std::uint64_t params) {
+        const std::uint32_t count = readPropertyCount(params + layout->structPropertyCount, layout->structPropertyCount16);
+        const std::uint64_t array = image.read<std::uint64_t>(params + layout->structProperties);
+        if (count > maxProperties || (count == 0 ? array != 0 : !dataRange(array, 8ull * count)))
+            return false;
+        for (std::uint32_t i = 0; i < count; i++) {
+            const std::uint64_t property = image.read<std::uint64_t>(array + 8ull * i);
+            if (!dataRange(property, propertySize) ||
+                !deferredName(image, image.read<std::uint64_t>(property + layout->propertyName), false))
+                return false;
+            const std::uint32_t kind = image.read<std::uint8_t>(property + layout->propertyType) & maxGenFlagsKind;
+            const std::uint32_t dimension = readPropertyCount(property + layout->propertyArrayDim, layout->propertyArrayDim16);
+            if (!translateKind(TypeNumbering::Engine5, kind) || dimension == 0 || dimension > maxArrayDim)
+                return false;
+        }
+        return true;
+    };
+    std::unordered_set<std::uint64_t> seen(registeredStructs.begin(), registeredStructs.end());
+    for (const std::uint64_t initializer : initializers) {
+        for (const auto& record : code.findPointerRecords(initializer)) {
+            const auto [construct, secondary, packageAddress, nameAddress, info] = record;
+            if (!image.isCode(construct) || secondary != 0 || info % 8 != 0 ||
+                !image.isWritableData(info) || !image.isWritableData(info + 15))
+                continue;
+            const auto package = deferredName(image, packageAddress, true);
+            const auto name = deferredName(image, nameAddress, true);
+            if (!package || !package->starts_with(scriptPrefixUtf8) || !name ||
+                !std::ranges::all_of(*name, [](char c) { return isIdentifierChar(char16_t(c)); }))
+                continue;
+            std::vector<std::uint64_t> candidates, tables;
+            for (const Call& call : preparedCalls(construct)) {
+                const std::uint64_t params = call.getConstant(1).value_or(0);
+                if (!dataRange(params, std::max<std::uint64_t>(32, layout->structPropertyCount + 4)))
+                    continue;
+                const auto paramName = deferredName(image, image.read<std::uint64_t>(params + structName), false);
+                //! Validate the same FStructParams header as isParams, using the bounded name already read instead of readUtf8's chunks.
+                const auto codeOrNull = [&](std::uint64_t offset) {
+                    const auto value = image.read<std::uint64_t>(params + offset);
+                    return value == 0 || image.isCode(value);
+                };
+                if (!paramName || !isIdentifierChar(char16_t(paramName->front())) ||
+                    !std::ranges::all_of(*paramName, [](char c) { return c == ':' || isIdentifierChar(char16_t(c)); }) ||
+                    !image.isCode(image.read<std::uint64_t>(params)) || !codeOrNull(structSuper) || !codeOrNull(structOps))
+                    continue;
+                if (!std::ranges::contains(tables, params))
+                    tables.push_back(params);
+                if (call.getConstant(0) != info || paramName != name || !propertiesValid(params))
+                    continue;
+                const std::uint64_t outer = image.read<std::uint64_t>(params);
+                std::vector<std::uint64_t> packages;
+                for (const Call& outerCall : preparedCalls(outer)) {
+                    const std::uint64_t table = outerCall.getConstant(1).value_or(0);
+                    if (dataRange(table, layout->packageSingletonCount + 4) &&
+                        deferredName(image, image.read<std::uint64_t>(table), false) == package &&
+                        !std::ranges::contains(packages, table))
+                        packages.push_back(table);
+                }
+                if (packages.size() == 1 && !std::ranges::contains(candidates, params))
+                    candidates.push_back(params);
+            }
+            if (candidates.size() == 1 && tables.size() == 1 && seen.insert(construct).second)
+                registeredStructs.push_back(construct);
         }
     }
 }
@@ -1178,17 +1287,10 @@ void Reflection::readEnum(const TypeRecord& record) {
     const std::string scope = engine5 ? packages[record.package] + '\n' : std::string();
     const std::string maxName = full(enumPrefixOf(enumerators, enumName) + "_MAX");
     if (!contains(full("MAX")) && !contains(maxName) && !usedEnumNames.contains(toLower(scope + maxName))) {
-        //! From UE 5.5 the parameters mark a UENUM(Flags) enum, whose largest value is the union of its single-bit enumerators.
-        const bool flags = layout->enumFlags != 0 && (image.read<std::uint8_t>(record.params + layout->enumFlags) & flagsEnum) != 0;
-        std::int64_t maxValue = 0;
-        if (flags) {
-            for (const EnumName& entry : enumerators)
-                if (std::has_single_bit(entry.value))
-                    maxValue |= std::int64_t(entry.value);
-        } else if (!enumerators.empty()) {
-            maxValue = std::ranges::max(enumerators | std::views::transform([](const EnumName& entry) { return std::int64_t(entry.value); }));
-        }
-        enumerators.push_back({maxName, std::uint64_t(maxValue + 1)});
+        const bool flags = enumMax != EnumMaxBehavior::Legacy && layout->enumFlags != 0 &&
+                           (image.read<std::uint8_t>(record.params + layout->enumFlags) & flagsEnum) != 0;
+        const std::uint64_t maxValue = syntheticEnumMax(enumerators | std::views::transform([](const EnumName& entry) { return entry.value; }), enumMax, flags);
+        enumerators.push_back({maxName, maxValue});
     }
     Enum entry{.name = name, .firstValue = std::uint32_t(schema.enumValues.size()), .valueCount = std::uint16_t(enumerators.size())};
     for (const EnumName& enumerator : enumerators) {
@@ -1213,6 +1315,7 @@ std::expected<Schema, Error> Reflection::read() {
     detectLayout();
     if (image.getError())
         return std::unexpected(*image.getError());
+    collectDeferredStructs(initializers);
     classifySingles();
     if (image.getError())
         return std::unexpected(*image.getError());
@@ -1233,6 +1336,8 @@ std::expected<Schema, Error> Reflection::read() {
     }
     if (image.getError())
         return std::unexpected(*image.getError());
+    if (engine5 && layout == &layout53)
+        enumMax = enumMaxBehavior(true, image.readFileVersion());
     detectTypeNumbering();
     detectPropertyOrder();
     collectPackageTypes();
