@@ -27,8 +27,14 @@ struct Mappings {
     std::vector<std::byte> usmap;
     //! JSON that names the struct of the keys and values of each map property, which an older property tag leaves out.
     std::string mapStructTypes;
+    //! JSON of every reflected type with its package, the class of each object property and the functions of each class; empty unless Options::ir is set.
+    std::string ir;
 };
 
-std::expected<Mappings, Error> generateMappings(const Source& executable);
+struct Options {
+    bool ir = false;
+};
+
+std::expected<Mappings, Error> generateMappings(const Source& executable, const Options& options = {});
 
 }

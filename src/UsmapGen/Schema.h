@@ -60,6 +60,7 @@ struct Property {
     std::uint16_t index = 0;
     std::uint8_t arrayDim = 1;
     std::uint32_t firstType = 0;
+    std::uint64_t flags = 0;
 };
 
 struct Struct {
@@ -96,6 +97,28 @@ private:
     std::unordered_map<std::string, std::uint32_t, Hash, std::equal_to<>> indices;
 };
 
+struct Function {
+    std::uint32_t name = 0;
+    std::uint32_t owner = 0;
+    std::uint32_t flags = 0;
+    std::uint32_t firstParameter = 0;
+    std::uint16_t parameterCount = 0;
+};
+
+//! What a usmap leaves out: the package of each type, which structs are classes, the class of an object property (in TypeNode::name) and the functions.
+struct Ir {
+    //! The names of functions and their parameters, kept out of the name table that the usmap writes.
+    NameTable names;
+    std::vector<std::string> packages;
+    std::vector<std::uint32_t> structPackages;
+    std::vector<std::uint32_t> enumPackages;
+    std::uint32_t classCount = 0;
+    std::vector<Function> functions;
+    std::vector<Property> parameters;
+    std::unordered_map<std::uint32_t, std::uint32_t> metaClasses;
+    std::uint32_t unreadFunctions = 0;
+};
+
 struct Schema {
     NameTable names;
     std::vector<Enum> enums;
@@ -103,9 +126,11 @@ struct Schema {
     std::vector<Struct> structs;
     std::vector<Property> properties;
     std::vector<TypeNode> types;
+    Ir ir;
 };
 
 std::vector<std::byte> writeUsmap(const Schema& schema);
 std::string writeMapStructTypes(const Schema& schema);
+std::string writeIr(const Schema& schema);
 
 }

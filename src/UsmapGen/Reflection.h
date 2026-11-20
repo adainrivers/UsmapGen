@@ -7,6 +7,6 @@
 
 namespace UsmapGen {
 
-std::expected<Schema, Error> readReflection(Image& image);
+std::expected<Schema, Error> readReflection(Image& image, bool withIr = false);
 
 }

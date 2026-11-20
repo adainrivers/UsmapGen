@@ -14,9 +14,12 @@ Generates a `.usmap` mappings file from a Win64 Unreal Engine executable, withou
 usmapgen Game.exe
 usmapgen C:/Games/Game.exe C:/Mappings/Game.usmap
 usmapgen Game.exe Game.usmap MapStructTypes.json
+usmapgen Game.exe Game.ir.json
 ```
 
 A `.json` output receives the MapStructTypes of CUE4Parse and FModel: the struct of the keys and values of each map property, for games with tagged properties. Without an output, `Game.usmap` and `Game_MapStructTypes.json` are written next to the executable.
+
+An `.ir.json` output receives what a usmap leaves out: the package of each type, classes apart from structs, the class of each object property, property flags, and the functions of each class with their parameters. It is written only when named.
 
 ## Library
 

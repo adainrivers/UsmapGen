@@ -52,6 +52,23 @@ constexpr std::uint8_t recordName = 0x10;
 constexpr std::uint8_t enumRecordStride = 0x20;
 constexpr std::uint8_t enumRecordName = 0x08;
 
+struct FunctionLayout {
+    std::uint8_t properties;
+    std::uint8_t propertyCount;
+    bool propertyCount16;
+    std::uint8_t flags;
+};
+
+//! FFunctionParams {OuterFunc, SuperFunc, NameUTF8, ...}: 5.6 drops OwningClassName and DelegateName before PropertyArray; until 5.2 a pointer-sized StructureSize precedes PropertyArray, a layout not checked against engine source.
+constexpr std::array<FunctionLayout, 3> functionLayouts{{{0x18, 0x20, true, 0x28}, {0x28, 0x30, true, 0x38}, {0x30, 0x38, false, 0x40}}};
+constexpr std::uint8_t functionName = 0x10;
+constexpr std::uint8_t functionParamsSize = 0x48;
+constexpr std::uint8_t classFunctions = 0x20;
+constexpr std::uint8_t functionLinkSize = 0x10;
+constexpr std::uint32_t maxFunctions = 0x7FF;
+constexpr std::uint8_t propertyFlags = 0x10;
+constexpr std::uint8_t propertyFlags418 = 0x18;
+
 struct Batch {
     std::uint64_t package;
     std::array<std::uint64_t, 3> arrays;
@@ -101,6 +118,8 @@ std::uint64_t findMostVoted(const Votes& votes) {
 }
 
 bool isNumeric(Kind kind) { return kind <= Kind::UInt64; }
+
+bool namesClass(Kind kind) { return kind >= Kind::SoftClass && kind <= Kind::Interface; }
 
 std::size_t childCountOf(Kind kind) {
     switch (kind) {
@@ -206,7 +225,7 @@ private:
 
 class Reflection {
 public:
-    explicit Reflection(Image& image) : image(image), code(image) {}
+    Reflection(Image& image, bool withIr) : image(image), code(image), withIr(withIr) {}
 
     std::expected<Schema, Error> read();
 
@@ -261,9 +280,24 @@ private:
     void readStruct(std::uint64_t params);
     void readEnum(const TypeRecord& record);
 
+    bool isDataRange(std::uint64_t at, std::uint64_t size) const;
+    std::optional<std::size_t> findClassNamedIn(std::uint64_t function, int depth);
+    std::uint32_t findReferencedClass(std::uint64_t function);
+    std::uint32_t findPackage(std::uint64_t outer);
+    std::uint32_t findClassPackage(const ClassInfo& info);
+    void collectPackages();
+    std::uint32_t readClassFunctionCount(std::uint64_t params);
+    std::uint64_t findFunctionParams(std::uint64_t function, std::string_view name);
+    std::optional<std::uint32_t> countFunctionProperties(std::uint64_t params, const FunctionLayout& candidate);
+    void readFunctions();
+
     Image& image;
     Code code;
     Schema schema;
+    bool withIr;
+    NameTable* propertyNames = &schema.names;
+    std::unordered_map<std::string, std::size_t> classesByBodyName;
+    std::unordered_map<std::uint64_t, std::uint32_t> referencedClasses;
 
     bool engine5 = false;
     EnumMaxBehavior enumMax = EnumMaxBehavior::Legacy;
@@ -980,6 +1014,13 @@ bool Reflection::readType(const std::uint64_t property, PropertyCursor& cursor, 
         node.name = resolveStruct(reference);
     if (*kind == Kind::Enum)
         node.name = resolveEnum(reference);
+    if (withIr && namesClass(*kind)) {
+        node.name = findReferencedClass(reference);
+        //! FClassPropertyParams names UClass first and the class of TSubclassOf second.
+        const std::uint32_t metaClass = *kind == Kind::Class ? findReferencedClass(image.read<std::uint64_t>(property + layout->propertyReference + 8)) : noName;
+        if (metaClass != noName)
+            schema.ir.metaClasses.emplace(std::uint32_t(schema.types.size()), metaClass);
+    }
     schema.types.push_back(node);
     const std::string parent = image.readUtf8(image.read<std::uint64_t>(property + layout->propertyName));
     for (std::size_t i = 0; i < childCountOf(*kind); i++) {
@@ -1011,15 +1052,16 @@ void Reflection::readProperties(const std::uint64_t array, const std::uint32_t c
     PropertyCursor cursor(readPointers(array, count), backward);
     while (!cursor.isEmpty() && !image.getError()) {
         const std::uint64_t entry = cursor.take();
-        const std::uint32_t name = schema.names.add(image.readUtf8(image.read<std::uint64_t>(entry + layout->propertyName)));
+        const std::uint32_t name = propertyNames->add(image.readUtf8(image.read<std::uint64_t>(entry + layout->propertyName)));
         const std::uint32_t arrayDim = readArrayDim(entry);
+        const std::uint64_t flags = image.read<std::uint64_t>(entry + (layout == &layout418 ? propertyFlags418 : propertyFlags));
         const std::uint32_t firstType = std::uint32_t(schema.types.size());
         if (!readType(entry, cursor, 0))
             return;
         //! A usmap property holds at most 255 elements of a static array; consecutive entries of the same property hold the rest.
         for (std::uint32_t rest = arrayDim; rest > 0;) {
             const std::uint32_t part = std::min(rest, maxUsmapArrayDim);
-            schema.properties.push_back({.name = name, .arrayDim = std::uint8_t(part), .firstType = firstType});
+            schema.properties.push_back({.name = name, .arrayDim = std::uint8_t(part), .firstType = firstType, .flags = flags});
             rest -= part;
         }
     }
@@ -1300,6 +1342,212 @@ void Reflection::readEnum(const TypeRecord& record) {
     schema.enums.push_back(entry);
 }
 
+bool Reflection::isDataRange(const std::uint64_t at, const std::uint64_t size) const {
+    return size != 0 && at <= UINT64_MAX - size && image.isData(at) && image.isData(at + size - 1);
+}
+
+//! A property names its class with Z_Construct_UClass_X_NoRegister, which no record registers; like StaticClass it reaches GetPrivateStaticClassBody(Package, Name, ...) through at most two functions.
+std::optional<std::size_t> Reflection::findClassNamedIn(const std::uint64_t function, const int depth) {
+    std::vector<std::uint64_t> callees;
+    for (const Call& call : code.findCalls(function)) {
+        const std::optional<std::uint64_t> package = call.getConstant(0);
+        const std::optional<std::uint64_t> name = call.getConstant(1);
+        if (package && name && image.startsWithUtf16(*package, scriptPrefix) && isWideName(*name)) {
+            const auto found = classesByBodyName.find(image.readUtf16(*name));
+            if (found != classesByBodyName.end())
+                return found->second;
+        }
+        if (image.isCode(call.target))
+            callees.push_back(call.target);
+    }
+    if (depth == maxGetterDepth)
+        return std::nullopt;
+    for (const std::uint64_t callee : callees) {
+        const std::uint64_t target = code.followThunks(callee);
+        if (const auto known = classOfFunction.find(target); known != classOfFunction.end())
+            return known->second;
+        if (const std::optional<std::size_t> named = findClassNamedIn(target, depth + 1))
+            return named;
+    }
+    return std::nullopt;
+}
+
+std::uint32_t Reflection::findReferencedClass(std::uint64_t function) {
+    if (!image.isCode(function))
+        return noName;
+    function = code.followThunks(function);
+    if (const auto known = referencedClasses.find(function); known != referencedClasses.end())
+        return known->second;
+    if (classesByBodyName.empty())
+        for (std::size_t index = 0; index < classes.size(); index++)
+            classesByBodyName.emplace(bodyNameOf(classes[index].registeredName), index);
+    std::optional<std::size_t> found;
+    if (const auto registered = classOfFunction.find(function); registered != classOfFunction.end())
+        found = registered->second;
+    else
+        found = findClassNamedIn(function, 0);
+    const std::uint32_t name = found ? classes[*found].name : noName;
+    referencedClasses.emplace(function, name);
+    return name;
+}
+
+std::uint32_t Reflection::findPackage(const std::uint64_t outer) {
+    const std::uint64_t package = image.isCode(outer) ? findParams(outer, ParamsKind::Package) : 0;
+    if (package == 0)
+        return noName;
+    if (const auto found = packageOfParams.find(package); found != packageOfParams.end())
+        return found->second;
+    packages.push_back(image.readUtf8(image.read<std::uint64_t>(package)));
+    const std::uint32_t index = std::uint32_t(packages.size() - 1);
+    packageOfParams.emplace(package, index);
+    return index;
+}
+
+//! FClassParams lists the package among the dependencies; an intrinsic class passes it to GetPrivateStaticClassBody.
+std::uint32_t Reflection::findClassPackage(const ClassInfo& info) {
+    if (info.params != 0) {
+        const std::uint64_t dependencies = image.read<std::uint64_t>(info.params + layout->classDependencies);
+        const std::uint32_t count = readDependencyCount(info.params);
+        for (std::uint32_t i = 0; i < count; i++) {
+            const std::uint64_t dependency = image.read<std::uint64_t>(dependencies + 8ull * i);
+            if (findClass(dependency))
+                continue;
+            if (const std::uint32_t package = findPackage(dependency); package != noName)
+                return package;
+        }
+    }
+    const std::optional<Call> body = findClassBody(code.followThunks(info.getter), bodyNameOf(info.registeredName), 0);
+    if (!body)
+        return noName;
+    std::string name = image.readUtf16(*body->getConstant(0));
+    if (const auto found = std::ranges::find(packages, name); found != packages.end())
+        return std::uint32_t(found - packages.begin());
+    packages.push_back(std::move(name));
+    return std::uint32_t(packages.size() - 1);
+}
+
+//! The structs of the schema are the classes, then the structs in the order of their queue.
+void Reflection::collectPackages() {
+    Ir& ir = schema.ir;
+    ir.classCount = std::uint32_t(classes.size());
+    for (const ClassInfo& info : classes)
+        ir.structPackages.push_back(findClassPackage(info));
+    for (const std::uint64_t params : structQueue)
+        ir.structPackages.push_back(findPackage(image.read<std::uint64_t>(params)));
+    for (const TypeRecord& record : enumQueue)
+        ir.enumPackages.push_back(record.package);
+    ir.packages = packages;
+}
+
+//! NumFunctions precedes NumProperties, in the packed word of 5.3 and as a field of its own before.
+std::uint32_t Reflection::readClassFunctionCount(const std::uint64_t params) {
+    if (layout->classPropertyCountPacked)
+        return image.read<std::uint32_t>(params + layout->classPropertyCount) >> 4 & 0x7FF;
+    return image.read<std::uint32_t>(params + layout->classPropertyCount - 4);
+}
+
+//! Z_Construct_UFunction passes its FFunctionParams to ConstructUFunction(Out, Params); the table repeats the name of the function link.
+std::uint64_t Reflection::findFunctionParams(std::uint64_t function, const std::string_view name) {
+    function = code.followThunks(function);
+    if (storedFunctions.insert(function).second)
+        applyStores(function);
+    for (const Call& call : code.findCalls(function)) {
+        const std::uint64_t params = call.getConstant(1).value_or(0);
+        if (!isDataRange(params, functionParamsSize))
+            continue;
+        const std::uint64_t nameAddress = image.read<std::uint64_t>(params + functionName);
+        if (isName(nameAddress) && image.readUtf8(nameAddress) == name)
+            return params;
+    }
+    return 0;
+}
+
+std::optional<std::uint32_t> Reflection::countFunctionProperties(const std::uint64_t params, const FunctionLayout& candidate) {
+    const std::uint64_t array = image.read<std::uint64_t>(params + candidate.properties);
+    const std::uint32_t count = readPropertyCount(params + candidate.propertyCount, candidate.propertyCount16);
+    if (count > maxProperties || (count == 0 ? array != 0 : !isDataRange(array, 8ull * count)))
+        return std::nullopt;
+    for (std::uint32_t i = 0; i < count; i++) {
+        const std::uint64_t property = image.read<std::uint64_t>(array + 8ull * i);
+        if (!isDataRange(property, layout->propertyReference + 16ull) || !isName(image.read<std::uint64_t>(property + layout->propertyName)) || !readKind(property))
+            return std::nullopt;
+        const std::uint32_t arrayDim = readPropertyCount(property + layout->propertyArrayDim, layout->propertyArrayDim16);
+        if (arrayDim == 0 || arrayDim > maxArrayDim)
+            return std::nullopt;
+    }
+    return count;
+}
+
+//! FClassParams lists {CreateFuncPtr, FuncNameUTF8} per function. A function whose tables do not read as expected is counted and left out; the engine before 4.22 is not read.
+void Reflection::readFunctions() {
+    if (layout == &layout418)
+        return;
+    struct Link {
+        std::uint32_t owner;
+        std::uint64_t params;
+        std::string name;
+    };
+    Ir& ir = schema.ir;
+    std::vector<Link> links;
+    for (std::size_t index = 0; index < classes.size(); index++) {
+        const std::uint64_t params = classes[index].params;
+        const std::uint32_t count = params == 0 ? 0 : readClassFunctionCount(params);
+        if (count == 0)
+            continue;
+        const std::uint64_t array = image.read<std::uint64_t>(params + classFunctions);
+        if (count > maxFunctions || !isDataRange(array, std::uint64_t(count) * functionLinkSize)) {
+            ir.unreadFunctions++;
+            continue;
+        }
+        for (std::uint32_t i = 0; i < count; i++) {
+            const std::uint64_t create = image.read<std::uint64_t>(array + std::uint64_t(i) * functionLinkSize);
+            const std::uint64_t nameAddress = image.read<std::uint64_t>(array + std::uint64_t(i) * functionLinkSize + 8);
+            std::string name = image.isCode(create) && isName(nameAddress) ? image.readUtf8(nameAddress) : std::string();
+            const std::uint64_t functionParams = name.empty() ? 0 : findFunctionParams(create, name);
+            if (functionParams == 0)
+                ir.unreadFunctions++;
+            else
+                links.push_back({std::uint32_t(index), functionParams, std::move(name)});
+        }
+    }
+    const FunctionLayout* functionLayout = nullptr;
+    std::uint64_t best = 0;
+    for (const FunctionLayout& candidate : functionLayouts) {
+        std::uint64_t score = 0;
+        for (const Link& link : links)
+            score += countFunctionProperties(link.params, candidate).transform([](std::uint32_t count) { return 1 + count; }).value_or(0);
+        if (score <= best)
+            continue;
+        best = score;
+        functionLayout = &candidate;
+    }
+    if (functionLayout == nullptr) {
+        ir.unreadFunctions += std::uint32_t(links.size());
+        return;
+    }
+    for (const Link& link : links) {
+        const std::optional<std::uint32_t> count = countFunctionProperties(link.params, *functionLayout);
+        if (!count) {
+            ir.unreadFunctions++;
+            continue;
+        }
+        Struct parameters;
+        const std::size_t first = schema.properties.size();
+        propertyNames = &ir.names;
+        readProperties(image.read<std::uint64_t>(link.params + functionLayout->properties), *count, std::format("{}::{}", classes[link.owner].registeredName, link.name), parameters);
+        propertyNames = &schema.names;
+        if (image.getError())
+            return;
+        ir.functions.push_back({.name = ir.names.add(link.name),
+                                .owner = link.owner,
+                                .flags = image.read<std::uint32_t>(link.params + functionLayout->flags),
+                                .firstParameter = std::uint32_t(ir.parameters.size()),
+                                .parameterCount = parameters.propertyCount});
+        ir.parameters.insert(ir.parameters.end(), schema.properties.begin() + std::ptrdiff_t(first), schema.properties.end());
+        schema.properties.resize(first);
+    }
+}
+
 std::expected<Schema, Error> Reflection::read() {
     const std::vector<std::uint64_t> initializers = findInitializers();
     if (image.getError())
@@ -1344,10 +1592,14 @@ std::expected<Schema, Error> Reflection::read() {
     if (image.getError())
         return std::unexpected(*image.getError());
     readClasses();
+    if (withIr && !image.getError())
+        readFunctions();
     for (std::size_t i = 0; i < structQueue.size() && !image.getError(); i++)
         readStruct(structQueue[i]);
     for (std::size_t i = 0; i < enumQueue.size() && !image.getError(); i++)
         readEnum(enumQueue[i]);
+    if (withIr && !image.getError())
+        collectPackages();
     if (image.getError())
         return std::unexpected(*image.getError());
     return std::move(schema);
@@ -1355,8 +1607,8 @@ std::expected<Schema, Error> Reflection::read() {
 
 }
 
-std::expected<Schema, Error> readReflection(Image& image) {
-    Reflection reflection(image);
+std::expected<Schema, Error> readReflection(Image& image, const bool withIr) {
+    Reflection reflection(image, withIr);
     return reflection.read();
 }
 
