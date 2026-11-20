@@ -79,6 +79,7 @@ struct ClassRecord {
     std::uint64_t construct;
     std::uint64_t getter;
     std::uint64_t name;
+    std::uint64_t package = 0;
 };
 
 struct SingleType {
@@ -99,6 +100,7 @@ struct ClassInfo {
     std::uint64_t construct;
     std::uint64_t getter;
     std::string registeredName;
+    std::uint64_t package = 0;
 };
 
 struct ClassBodySignature {
@@ -529,7 +531,7 @@ void Reflection::readEngine5Records(std::span<const Batch> batches) {
             const std::uint64_t record = batch.arrays[0] + i * classLayout->stride;
             const std::uint64_t construct = image.read<std::uint64_t>(record);
             const std::uint64_t getter = classLayout->name == recordName ? image.read<std::uint64_t>(record + 8) : construct;
-            classRecords.push_back({construct, getter, image.read<std::uint64_t>(record + classLayout->name)});
+            classRecords.push_back({construct, getter, image.read<std::uint64_t>(record + classLayout->name), batch.package});
         }
         for (std::uint64_t i = 0; i < batch.counts[1]; i++)
             registeredStructs.push_back(image.read<std::uint64_t>(batch.arrays[1] + i * structStride));
@@ -565,7 +567,7 @@ void Reflection::collectSingles(std::span<const std::uint64_t> initializers) {
                     continue;
                 if (package >= 3 && isWideName(argument(package - 1)) && image.isCode(argument(package - 2)) &&
                     image.isCode(argument(package - 3))) {
-                    classRecords.push_back({argument(package - 3), argument(package - 2), argument(package - 1)});
+                    classRecords.push_back({argument(package - 3), argument(package - 2), argument(package - 1), argument(package)});
                     break;
                 }
                 if (!image.isCode(argument(package - 1)))
@@ -578,7 +580,7 @@ void Reflection::collectSingles(std::span<const std::uint64_t> initializers) {
                 if (!isWideName(argument(package + 1)))
                     continue;
                 if (package >= 2 && image.isCode(argument(package - 2))) {
-                    classRecords.push_back({argument(package - 2), argument(package - 1), argument(package + 1)});
+                    classRecords.push_back({argument(package - 2), argument(package - 1), argument(package + 1), argument(package)});
                     break;
                 }
                 singleTypes.push_back({argument(package - 1), argument(package + 1)});
@@ -1134,7 +1136,7 @@ void Reflection::collectClasses() {
         const std::uint64_t params = findParams(construct, ParamsKind::Class);
         classOfFunction.emplace(construct, classes.size());
         classOfFunction.emplace(code.followThunks(record.getter), classes.size());
-        classes.push_back({name, params, construct, record.getter, std::move(registeredName)});
+        classes.push_back({name, params, construct, record.getter, std::move(registeredName), record.package});
     }
     //! An intrinsic class can inline the Z_Construct of its super, whose parameters start with the StaticClass of the super.
     for (std::size_t index = 0; index < classes.size(); index++) {
@@ -1403,8 +1405,16 @@ std::uint32_t Reflection::findPackage(const std::uint64_t outer) {
     return index;
 }
 
-//! FClassParams lists the package among the dependencies; an intrinsic class passes it to GetPrivateStaticClassBody.
+//! A class registers with its package; a class that classifySingles found has it only among the dependencies of FClassParams or in its call of GetPrivateStaticClassBody.
 std::uint32_t Reflection::findClassPackage(const ClassInfo& info) {
+    const auto indexOf = [&](std::string name) {
+        if (const auto found = std::ranges::find(packages, name); found != packages.end())
+            return std::uint32_t(found - packages.begin());
+        packages.push_back(std::move(name));
+        return std::uint32_t(packages.size() - 1);
+    };
+    if (image.startsWithUtf16(info.package, scriptPrefix))
+        return indexOf(image.readUtf16(info.package));
     if (info.params != 0) {
         const std::uint64_t dependencies = image.read<std::uint64_t>(info.params + layout->classDependencies);
         const std::uint32_t count = readDependencyCount(info.params);
@@ -1419,11 +1429,7 @@ std::uint32_t Reflection::findClassPackage(const ClassInfo& info) {
     const std::optional<Call> body = findClassBody(code.followThunks(info.getter), bodyNameOf(info.registeredName), 0);
     if (!body)
         return noName;
-    std::string name = image.readUtf16(*body->getConstant(0));
-    if (const auto found = std::ranges::find(packages, name); found != packages.end())
-        return std::uint32_t(found - packages.begin());
-    packages.push_back(std::move(name));
-    return std::uint32_t(packages.size() - 1);
+    return indexOf(image.readUtf16(*body->getConstant(0)));
 }
 
 //! The structs of the schema are the classes, then the structs in the order of their queue.
